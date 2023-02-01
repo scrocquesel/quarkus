@@ -5,8 +5,11 @@ import static java.util.Arrays.asList;
 
 import java.io.BufferedWriter;
 import java.io.IOException;
+import java.nio.file.FileSystem;
+import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.PathMatcher;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
@@ -17,6 +20,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.function.Predicate;
 import java.util.stream.Stream;
 
 import org.eclipse.microprofile.config.Config;
@@ -47,6 +51,8 @@ public class GrpcCodeGen implements CodeGenProvider {
     private static final String PROTOC_GROUPID = "com.google.protobuf";
 
     private static final String SCAN_DEPENDENCIES_FOR_PROTO = "quarkus.generate-code.grpc.scan-for-proto";
+    private static final String SCAN_DEPENDENCIES_FOR_PROTO_INCLUDE_PATTERN = "quarkus.generate-code.grpc.scan-for-proto-include.\"%s\"";
+    private static final String SCAN_DEPENDENCIES_FOR_PROTO_EXCLUDE_PATTERN = "quarkus.generate-code.grpc.scan-for-proto-exclude.\"%s\"";
     private static final String SCAN_FOR_IMPORTS = "quarkus.generate-code.grpc.scan-for-imports";
 
     private static final String POST_PROCESS_SKIP = "quarkus.generate.code.grpc-post-processing.skip";
@@ -205,10 +211,18 @@ public class GrpcCodeGen implements CodeGenProvider {
         ApplicationModel appModel = context.applicationModel();
         List<Path> protoFilesFromDependencies = new ArrayList<>();
         for (ResolvedDependency artifact : appModel.getRuntimeDependencies()) {
+            String packageId = String.format("%s:%s", artifact.getGroupId(), artifact.getArtifactId());
+            Collection<String> includes = properties
+                    .getOptionalValues(String.format(SCAN_DEPENDENCIES_FOR_PROTO_INCLUDE_PATTERN, packageId), String.class)
+                    .orElse(List.of());
+            Collection<String> excludes = properties
+                    .getOptionalValues(String.format(SCAN_DEPENDENCIES_FOR_PROTO_EXCLUDE_PATTERN, packageId), String.class)
+                    .orElse(List.of());
+
             if (scanAll
-                    || dependenciesToScan.contains(
-                            String.format("%s:%s", artifact.getGroupId(), artifact.getArtifactId()))) {
-                extractProtosFromArtifact(workDir, protoFilesFromDependencies, protoDirectories, artifact, true);
+                    || dependenciesToScan.contains(packageId)) {
+                extractProtosFromArtifact(workDir, protoFilesFromDependencies, protoDirectories, artifact, includes, excludes,
+                        true);
             }
         }
         return protoFilesFromDependencies;
@@ -244,20 +258,26 @@ public class GrpcCodeGen implements CodeGenProvider {
             if (scanAll
                     || dependenciesToScan.contains(
                             String.format("%s:%s", artifact.getGroupId(), artifact.getArtifactId()))) {
-                extractProtosFromArtifact(workDir, new ArrayList<>(), importDirectories, artifact, false);
+                extractProtosFromArtifact(workDir, new ArrayList<>(), importDirectories, artifact, List.of(),
+                        List.of(), false);
             }
         }
         return importDirectories;
     }
 
     private void extractProtosFromArtifact(Path workDir, Collection<Path> protoFiles,
-            Set<String> protoDirectories, ResolvedDependency artifact, boolean isDependency) throws CodeGenException {
+            Set<String> protoDirectories, ResolvedDependency artifact, Collection<String> filesToInclude,
+            Collection<String> filesToExclude, boolean isDependency) throws CodeGenException {
 
         try {
+            var includesPredicate = createPathMatcherPredicate(filesToInclude, true);
+            var excludesPredicate = createPathMatcherPredicate(filesToExclude, false);
+
             artifact.getContentTree().walk(
                     pathVisit -> {
                         Path path = pathVisit.getPath();
-                        if (Files.isRegularFile(path) && path.getFileName().toString().endsWith(PROTO)) {
+                        if (Files.isRegularFile(path) && path.getFileName().toString().endsWith(PROTO)
+                                && !excludesPredicate.test(path) && includesPredicate.test(path)) {
                             Path root = pathVisit.getRoot();
                             if (Files.isDirectory(root)) {
                                 protoFiles.add(path);
@@ -385,6 +405,32 @@ public class GrpcCodeGen implements CodeGenProvider {
                 throw new CodeGenException(
                         "Unsupported OS, please use maven plugin instead to generate Java classes from proto files");
         }
+    }
+
+    private static Predicate<Path> createPathMatcherPredicate(Collection<String> globPatterns, boolean defaultIfEmpty) {
+        if (globPatterns.isEmpty()) {
+            return new Predicate<Path>() {
+                @Override
+                public boolean test(Path path) {
+                    return defaultIfEmpty;
+                }
+            };
+        }
+
+        System.out.println(globPatterns);
+
+        FileSystem fs = FileSystems.getDefault();
+        var t = globPatterns.stream().map(g -> (Predicate<Path>) new Predicate<Path>() {
+            final PathMatcher pathMatcher = fs.getPathMatcher("glob:" + g);
+
+            @Override
+            public boolean test(Path path) {
+                System.out.println("test:" + path);
+                return pathMatcher.matches(path);
+            }
+        }).reduce(Predicate::or).get();
+
+        return t;
     }
 
     private static Path prepareQuarkusGrpcExecutable(ApplicationModel appModel, Path buildDir) throws CodeGenException {
